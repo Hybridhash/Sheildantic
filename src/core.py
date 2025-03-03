@@ -1,172 +1,206 @@
-# security_validation/core.py (Slightly stricter test SanitizationConfig)
-
-from typing import Type, TypeVar, Generic, Any, Annotated, Mapping
-from pydantic import BaseModel, ValidationError, Field, field_validator
-from pydantic.functional_validators import AfterValidator
+# core.py
+from typing import Type, TypeVar, Mapping, Any, get_origin
+from pydantic import BaseModel, ValidationError
 from multidict import MultiDict
 import nh3
-import json
-
-from .models import ValidationResult, ValidationErrorDetail, SanitizationConfig
+from src.models import ValidationResult, SanitizationConfig, ValidationErrorDetail
 
 T = TypeVar('T', bound=BaseModel)
 
-def html_sanitizer(value: str, config: SanitizationConfig) -> str:
-    """
-    Sanitize an HTML string according to the provided configuration.
-
-    Args:
-        value: The HTML string to be sanitized.
-        config: A SanitizationConfig instance containing sanitization settings.
-
-    Returns:
-        A sanitized version of the input HTML string.
-    """
-    return nh3.clean(
-        value,
-        tags=config.tags,
-        attributes=config.attributes,
-        url_schemes=config.url_schemes,
-        strip_comments=config.strip_comments,
-        link_rel=config.link_rel,
-        clean_content_tags=config.clean_content_tags,
-        generic_attribute_prefixes=config.generic_attribute_prefixes
-    )
-
-def validate_sanitized_string(value: str) -> str:
-    """
-    Validate that the value is a string. Intended to be used as a post-validation step.
-
-    Args:
-        value: The value to validate.
-
-    Raises:
-        ValueError: If the provided value is not a string.
-
-    Returns:
-        The original string if valid.
-    """
-    if not isinstance(value, str):
-        raise ValueError("Value must be a string")
-    return value
-
-SanitizedString = Annotated[str, AfterValidator(validate_sanitized_string)]
-
-class InputValidator(Generic[T]):
-    """
-    A generic input validator and sanitizer for Pydantic models.
-
-    This class takes a Pydantic model and a sanitization configuration. It provides
-    asynchronous methods to sanitize input data and validate it against the model.
-    """
-
+class InputValidator:
     def __init__(self, model: Type[T], config: SanitizationConfig):
-        """
-        Initialize the InputValidator.
-
-        Args:
-            model: A Pydantic model class to validate against.
-            config: A SanitizationConfig instance for sanitizing input values.
-        """
         self.model = model
         self.config = config
-        self.field_names = model.model_fields.keys()
+        self.list_fields = self._identify_list_fields()
+
+    def _identify_list_fields(self) -> set:
+        list_fields = set()
+        for field_name, field in self.model.model_fields.items():
+            if get_origin(field.annotation) is list:
+                list_fields.add(field_name)
+        return list_fields
 
     async def sanitize_input(self, raw_data: Mapping[str, Any]) -> dict[str, Any]:
-        """
-        Sanitize the raw input data.
-
-        Iterates over model fields, sanitizes each value using _sanitize_value,
-        and returns a sanitized data dictionary.
-
-        Args:
-            raw_data: A mapping of field names to their raw input values.
-
-        Returns:
-            A dictionary of sanitized data.
-        """
         sanitized = {}
-        for field in self.field_names:
-            value = raw_data.get(field)
-            if value is None:
-                continue
-
-            if isinstance(value, list):
-                sanitized[field] = [self._sanitize_value(v) for v in value]
-            else:
-                sanitized[field] = self._sanitize_value(value)
+        for field in self.model.model_fields:
+            if field in self.list_fields:
+                values = self._get_multi_values(raw_data, field)
+                sanitized[field] = [self._sanitize_value(v) for v in values]
+            elif field in raw_data:
+                value = raw_data.get(field)
+                if value is not None:
+                    if self.model.model_fields[field].annotation is bool:
+                        # Explicitly convert to bool with strict validation
+                        if isinstance(value, str):
+                            value_lower = value.lower()
+                            if value_lower in ("true", "1", "yes"):
+                                sanitized[field] = True
+                            elif value_lower in ("false", "0", "no"):
+                                sanitized[field] = False
+                            else:
+                                # For invalid boolean values, store as string to force validation error
+                                sanitized[field] = str(value)
+                        elif isinstance(value, int) or isinstance(value, bool):
+                            sanitized[field] = bool(value)
+                        else:
+                            sanitized[field] = str(value)  # Force string for non-boolean types
+                    else:
+                        sanitized[field] = self._sanitize_value(value)
         return sanitized
 
+    def _get_multi_values(self, data: Mapping[str, Any], field: str) -> list:
+        if isinstance(data, MultiDict):
+            return data.getall(field, [])
+        value = data.get(field)
+        return value if isinstance(value, list) else [value] if value is not None else []
+
     def _sanitize_value(self, value: Any) -> Any:
-        """
-        Recursively sanitize a single value.
-
-        Depending on the type of value, the function will:
-        - Sanitize strings using html_sanitizer.
-        - Recursively process lists and dictionaries.
-        - Return the original value for other types.
-
-        Args:
-            value: The value to sanitize.
-
-        Returns:
-            The sanitized value.
-        """
         if isinstance(value, str):
-            return html_sanitizer(value, self.config)
+            # For sanitized_data, we preserve HTML but filter unsafe elements
+            ammonia_params = self.config.model_dump()
+            max_field_size = ammonia_params.pop('max_field_size', None)
+            
+            sanitized = nh3.clean(value, **ammonia_params)
+            
+            # Add max length validation
+            if max_field_size and len(sanitized) > max_field_size:
+                raise ValueError(f"Field exceeds maximum size {max_field_size}")
+            return sanitized
         if isinstance(value, list):
             return [self._sanitize_value(v) for v in value]
         if isinstance(value, dict):
             return {k: self._sanitize_value(v) for k, v in value.items()}
         return value
+        
+    def _clean_for_model(self, value: Any) -> Any:
+        """Clean HTML for model but preserve structure"""
+        if isinstance(value, str):
+            # For model data, we strip all HTML tags
+            return nh3.clean(value, tags=set())
+        if isinstance(value, list):
+            return [self._clean_for_model(v) for v in value]
+        if isinstance(value, dict):
+            return {k: self._clean_for_model(v) for k, v in value.items()}
+        return value
 
     async def validate(self, raw_data: Mapping[str, Any]) -> ValidationResult[T]:
-        """
-        Validate the sanitized input data against the provided Pydantic model.
-
-        This method sanitizes the raw data, attempts to create a model instance,
-        and records any validation errors found.
-
-        Args:
-            raw_data: A mapping of field names to raw input values.
-
-        Returns:
-            A ValidationResult instance containing the model instance, sanitized data,
-            and any validation errors.
-        """
         result = ValidationResult[T](is_valid=False)
         try:
+            # First pass - sanitize but preserve HTML structure
             sanitized = await self.sanitize_input(raw_data)
             result.sanitized_data = sanitized
-            model_instance = self.model(**sanitized)
+            
+            # Check for invalid boolean values BEFORE model validation
+            for field_name, field in self.model.model_fields.items():
+                if field_name in sanitized:
+                    value = sanitized[field_name]
+                    if field.annotation is bool:
+                        if isinstance(value, str):  # Any string value not in accepted bool values is an error
+                            valid_bools = {"true", "1", "yes", "false", "0", "no"}
+                            if value.lower() not in valid_bools:
+                                result.errors.append(ValidationErrorDetail(
+                                    field=field_name,
+                                    message=f"Value '{value}' could not be parsed to a boolean",
+                                    input_value=raw_data.get(field_name),
+                                    sanitized_value=value
+                                ))
+                    elif get_origin(field.annotation) is list and isinstance(value, list):
+                        # Check list items match the expected type
+                        inner_type = field.annotation.__args__[0]
+                        for i, item in enumerate(value):
+                            if inner_type is int and not isinstance(item, int):
+                                try:
+                                    int(item)  # Try conversion
+                                except (ValueError, TypeError):
+                                    result.errors.append(ValidationErrorDetail(
+                                        field=field_name,
+                                        message=f"Value '{item}' at index {i} could not be parsed to an integer",
+                                        input_value=raw_data.get(field_name),
+                                        sanitized_value=value
+                                    ))
+            
+            # If we already found errors, stop processing
+            if result.errors:
+                return result
+                
+            # Second pass - clean all HTML for the model
+            model_data = {k: self._clean_for_model(v) for k, v in sanitized.items()}
+            
+            # Check for missing required fields before validation
+            self._check_missing_required_fields(model_data, result)
+            if result.errors:
+                return result
+            
+            model_instance = self.model(**model_data)
             result.model = model_instance
             result.is_valid = True
-        except ValidationError as e:
-            self._process_errors(e, result, raw_data, sanitized)
+        except (ValidationError, ValueError) as e:
+            result.sanitized_data = sanitized if 'sanitized' in locals() else {}
+            if isinstance(e, ValueError):
+                # Handle max length errors
+                result.errors.append(ValidationErrorDetail(
+                    field="general",
+                    message=str(e),
+                    input_value=None,
+                    sanitized_value=None
+                ))
+            else:
+                # Process errors from Pydantic
+                for error in e.errors():
+                    if not error['loc']:
+                        field_name = "general"
+                    else:
+                        field_path = error['loc'][0]
+                        field_name = str(field_path).split('.')[0]
+                    
+                    result.errors.append(ValidationErrorDetail(
+                        field=field_name,
+                        message=error['msg'],
+                        input_value=raw_data.get(field_name) if field_name != "general" else None,
+                        sanitized_value=sanitized.get(field_name) if field_name != "general" else None
+                    ))
+        
         return result
 
-    def _process_errors(self, e: ValidationError, 
-                        result: ValidationResult[T],
-                        raw_data: Mapping[str, Any],
-                        sanitized: dict[str, Any]) -> None:
-        """
-        Process validation errors and populate the ValidationResult.
+    def _check_missing_required_fields(self, data: dict, result: ValidationResult[T]):
+        """Check for missing required fields and add them to errors"""
+        for field_name, field in self.model.model_fields.items():
+            # Check if field is required and missing
+            if field.is_required() and field_name not in data:
+                result.errors.append(ValidationErrorDetail(
+                    field=field_name,
+                    message=f"Field required",
+                    input_value=None,
+                    sanitized_value=None
+                ))
 
-        Iterates over the errors produced by Pydantic and appends a corresponding
-        ValidationErrorDetail for each error to the result.
-
-        Args:
-            e: The ValidationError exception raised by Pydantic.
-            result: The ValidationResult instance to be updated.
-            raw_data: The original raw input data.
-            sanitized: The sanitized version of the input data.
-        """
+    def _process_errors(self, e: ValidationError, result: ValidationResult[T], 
+                       raw_data: Mapping, sanitized: dict):
+        """Process validation errors from Pydantic"""
         for error in e.errors():
-            field = error['loc'][0]
+            # Extract the field name from the location
+            if not error['loc']:
+                field_name = "general"
+            else:
+                # Handle both simple fields and nested fields like friends.0
+                field_name = str(error['loc'][0])
+            
+            # Create the error detail
+            input_value = raw_data.get(field_name) if field_name != "general" else None
+            sanitized_value = sanitized.get(field_name) if field_name != "general" else None
+            
+            # Special handling for list field errors (e.g., friends.0)
+            if '.' in field_name and field_name.split('.')[0] in self.list_fields:
+                base_field = field_name.split('.')[0]
+                input_value = raw_data.get(base_field) if base_field in raw_data else None
+                sanitized_value = sanitized.get(base_field) if base_field in sanitized else None
+                # Use the base field name for the error
+                field_name = base_field
+            
+            # Always add the specific field error
             result.errors.append(ValidationErrorDetail(
-                field=str(field),
+                field=field_name,
                 message=error['msg'],
-                input_value=raw_data.get(str(field)),
-                sanitized_value=sanitized.get(str(field))
+                input_value=input_value,
+                sanitized_value=sanitized_value
             ))
-
