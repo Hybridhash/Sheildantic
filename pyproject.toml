@@ -1,15 +1,54 @@
-[project]
-name = "sheildantic-nosync"
+[tool.poetry]
+name = "sheildantic"
 version = "0.1.0"
-description = "Add your description here"
+description = "A robust data validation and serialization library built on top of Pydantic"
+authors = ["Mohd Ahmad <mohd.ahmad.dev@gmail.com>"]
 readme = "README.md"
-requires-python = ">=3.12.8"
-dependencies = [
-    "fastapi>=0.115.8",
-    "httpx>=0.28.1",
-    "multidict>=6.1.0",
-    "nh3>=0.2.20",
-    "pydantic>=2.10.6",
-    "pytest>=8.3.4",
-    "python-multipart>=0.0.20",
+packages = [
+    { include = "sheildantic", from = "src" }
 ]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pydantic = "^2.5.3"
+multidict = "^6.1.0"
+nh3 = "^0.2.20"
+fastapi = "^0.115.8"
+httpx = "^0.28.1"
+anyio = "^4.8.0"
+pytest-asyncio = "^0.25.3"
+pytest-tornasync = "^0.6.0.post2"
+pytest-trio = "^0.8.0"
+pytest-twisted = "^1.14.3"
+twisted = "^24.11.0"
+rich = "^13.9.4"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-cov = "^4.1.0"
+black = "^24.1.1"
+isort = "^5.13.2"
+mypy = "^1.8.0"
+ruff = "^0.2.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"

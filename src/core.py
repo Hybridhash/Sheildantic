@@ -4,6 +4,10 @@ from pydantic import BaseModel, ValidationError
 from multidict import MultiDict
 import nh3
 from src.models import ValidationResult, SanitizationConfig, ValidationErrorDetail
+import decimal
+import enum
+import datetime
+import re
 
 T = TypeVar('T', bound=BaseModel)
 
@@ -20,6 +24,21 @@ class InputValidator:
                 list_fields.add(field_name)
         return list_fields
 
+    def _parse_bool(self, value: Any) -> bool | str:
+        # Map string representations to booleans
+        bool_map = {
+            "true": True, "1": True, "yes": True,
+            "false": False, "0": False, "no": False
+        }
+        if isinstance(value, str):
+            value_lower = value.lower()
+            if value_lower in bool_map:
+                return bool_map[value_lower]
+            return str(value)  # Invalid string, return as-is for error reporting
+        if isinstance(value, (int, bool)):
+            return bool(value)
+        return str(value)  # Non-standard types, return as string
+
     async def sanitize_input(self, raw_data: Mapping[str, Any]) -> dict[str, Any]:
         sanitized = {}
         for field in self.model.model_fields:
@@ -30,20 +49,7 @@ class InputValidator:
                 value = raw_data.get(field)
                 if value is not None:
                     if self.model.model_fields[field].annotation is bool:
-                        # Explicitly convert to bool with strict validation
-                        if isinstance(value, str):
-                            value_lower = value.lower()
-                            if value_lower in ("true", "1", "yes"):
-                                sanitized[field] = True
-                            elif value_lower in ("false", "0", "no"):
-                                sanitized[field] = False
-                            else:
-                                # For invalid boolean values, store as string to force validation error
-                                sanitized[field] = str(value)
-                        elif isinstance(value, int) or isinstance(value, bool):
-                            sanitized[field] = bool(value)
-                        else:
-                            sanitized[field] = str(value)  # Force string for non-boolean types
+                        sanitized[field] = self._parse_bool(value)
                     else:
                         sanitized[field] = self._sanitize_value(value)
         return sanitized
@@ -55,21 +61,36 @@ class InputValidator:
         return value if isinstance(value, list) else [value] if value is not None else []
 
     def _sanitize_value(self, value: Any) -> Any:
+        if value is None:
+            return None
         if isinstance(value, str):
-            # For sanitized_data, we preserve HTML but filter unsafe elements
             ammonia_params = self.config.model_dump()
             max_field_size = ammonia_params.pop('max_field_size', None)
-            
             sanitized = nh3.clean(value, **ammonia_params)
-            
-            # Add max length validation
             if max_field_size and len(sanitized) > max_field_size:
                 raise ValueError(f"Field exceeds maximum size {max_field_size}")
             return sanitized
-        if isinstance(value, list):
-            return [self._sanitize_value(v) for v in value]
+        if isinstance(value, (int, float, decimal.Decimal)):
+            return value
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            return value
+        if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+            return value
+        if isinstance(value, enum.Enum):
+            return value.value
+        if isinstance(value, (list, tuple, set)):
+            sanitized_iterable = [self._sanitize_value(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(sanitized_iterable)
+            elif isinstance(value, set):
+                return set(sanitized_iterable)
+            return sanitized_iterable
         if isinstance(value, dict):
             return {k: self._sanitize_value(v) for k, v in value.items()}
+        if hasattr(value, '__dict__'):
+            return {k: self._sanitize_value(v) for k, v in value.__dict__.items()}
         return value
         
     def _clean_for_model(self, value: Any) -> Any:
@@ -147,17 +168,44 @@ class InputValidator:
             else:
                 # Process errors from Pydantic
                 for error in e.errors():
-                    if not error['loc']:
-                        field_name = "general"
-                    else:
-                        field_path = error['loc'][0]
-                        field_name = str(field_path).split('.')[0]
                     
+                    field_name = "general"
+                    
+                    
+                    current_loc = error.get('loc')
+                    error_msg_content = error.get('msg', '')
+                    print(f"DEBUG: Processing Pydantic error. error['loc'] = {repr(current_loc)}")
+                    print(f"DEBUG: error['msg'] for regex = {repr(error_msg_content)}")
+                    
+
+                    if current_loc: 
+                        if isinstance(current_loc, (list, tuple)) and current_loc: 
+                            field_name = ".".join(str(part) for part in current_loc)
+                        else: # If loc is a string or other truthy non-list/tuple, or empty list/tuple was handled by outer if
+                            field_name = str(current_loc) 
+                            if not field_name: # If str(current_loc) resulted in empty string
+                                field_name = "general" 
+                    
+                    # If field_name is still "general", it means loc didn't yield a field name
+                    if field_name == "general" or not current_loc : # Added 'not current_loc' to ensure fallback if loc was initially None/empty
+                        
+                        msg_for_regex = error.get('msg', '')
+                        
+                        match = re.search(r"\n(\w+)\n", msg_for_regex)
+                        # ---- START DEBUG ----
+                        if match:
+                            print(f"DEBUG: Regex matched. Groups: {match.groups()}")
+                        else:
+                            print(f"DEBUG: Regex did NOT match on msg: {repr(msg_for_regex)}")
+                        # ---- END DEBUG ----
+                        if match:
+                            field_name = match.group(1)
+                            
                     result.errors.append(ValidationErrorDetail(
                         field=field_name,
-                        message=error['msg'],
-                        input_value=raw_data.get(field_name) if field_name != "general" else None,
-                        sanitized_value=sanitized.get(field_name) if field_name != "general" else None
+                        message=error.get('msg', ''), # Use error.get('msg', '') directly here
+                        input_value=raw_data.get(field_name.split('.')[0]) if field_name != "general" else None,
+                        sanitized_value=sanitized.get(field_name.split('.')[0]) if field_name != "general" else None
                     ))
         
         return result
@@ -174,33 +222,4 @@ class InputValidator:
                     sanitized_value=None
                 ))
 
-    def _process_errors(self, e: ValidationError, result: ValidationResult[T], 
-                       raw_data: Mapping, sanitized: dict):
-        """Process validation errors from Pydantic"""
-        for error in e.errors():
-            # Extract the field name from the location
-            if not error['loc']:
-                field_name = "general"
-            else:
-                # Handle both simple fields and nested fields like friends.0
-                field_name = str(error['loc'][0])
-            
-            # Create the error detail
-            input_value = raw_data.get(field_name) if field_name != "general" else None
-            sanitized_value = sanitized.get(field_name) if field_name != "general" else None
-            
-            # Special handling for list field errors (e.g., friends.0)
-            if '.' in field_name and field_name.split('.')[0] in self.list_fields:
-                base_field = field_name.split('.')[0]
-                input_value = raw_data.get(base_field) if base_field in raw_data else None
-                sanitized_value = sanitized.get(base_field) if base_field in sanitized else None
-                # Use the base field name for the error
-                field_name = base_field
-            
-            # Always add the specific field error
-            result.errors.append(ValidationErrorDetail(
-                field=field_name,
-                message=error['msg'],
-                input_value=input_value,
-                sanitized_value=sanitized_value
-            ))
+ 
