@@ -17,8 +17,17 @@ Sheildantic provides a seamless way to sanitize and validate user input from web
 
 ## Installation
 
+You can install Sheildantic directly from the GitHub repository:
+
 ```bash
-pip install sheildantic
+# Using pip
+pip install git+https://github.com/Hybridhash/Sheildantic.git@main
+
+# Using poetry
+poetry add git+https://github.com/Hybridhash/Sheildantic.git@main
+
+# Using uv
+uv pip install git+https://github.com/Hybridhash/Sheildantic.git@main
 ```
 
 ## Usage
