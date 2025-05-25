@@ -18,6 +18,33 @@ class ValidationResult(BaseModel, Generic[T]):
     sanitized_data: dict[str, Any] = {}
 
 class SanitizationConfig(BaseModel):
+    """
+    Configuration for HTML sanitization using nh3.clean().
+
+    By default, nh3 uses:
+        - tags: ALLOWED_TAGS
+        - attributes: ALLOWED_ATTRIBUTES
+        - url_schemes: ALLOWED_URL_SCHEMES
+    You can import these from this module to customize your config.
+
+    Examples:
+        # Remove the <b> tag from allowed tags
+        tags = nh3.ALLOWED_TAGS - {"b"}
+        nh3.clean("<b><i>yeah</i></b>", tags=tags)
+        # Output: '<i>yeah</i>'
+
+        # Add a custom attribute to <img> tags
+        from copy import deepcopy
+        attributes = deepcopy(nh3.ALLOWED_ATTRIBUTES)
+        attributes["img"].add("data-invert")
+        nh3.clean("<img src='example.jpeg' data-invert=true>", attributes=attributes)
+        # Output: '<img src="example.jpeg" data-invert="true">'
+
+        # Remove 'tel' from allowed URL schemes
+        url_schemes = nh3.ALLOWED_URL_SCHEMES - {'tel'}
+        nh3.clean('<a href="tel:+1">Call</a> or <a href="mailto:contact@me">email</a> me.', url_schemes=url_schemes)
+        # Output: '<a rel="noopener noreferrer">Call</a> or <a href="mailto:contact@me" rel="noopener noreferrer">email</a> me.'
+    """
     tags: set[str] | None = None
     attributes: dict[str, set[str]] | None = None
     url_schemes: set[str] | None = None
