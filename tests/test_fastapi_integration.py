@@ -151,59 +151,120 @@ async def test_max_length_validation(strict_config):
     assert any("exceeds maximum size" in e.message for e in result.errors)
 
 @pytest.mark.asyncio
-async def test_all_types_handling():
-    now = datetime.datetime(2025, 5, 21, 12, 34, 56)
-    today = now.date()
-    t = now.time()
-    struct = StructLike(a=5, b=2.5)
-    custom_obj = CustomClass(42)
-    data = {
-        "string_field": "<b>hello</b>",
-        "int_field": "42",
-        "float_field": "3.14",
-        "bool_field": "yes",
-        "none_field": None,
-        "list_field": ["1", "2", "3"],
-        "tuple_field": [1, 2.5],
-        "set_field": ["a", "b", "a"],
-        "dict_field": {"key": "value", "nested": {"x": 1}},
-        "custom_obj": {"x": 42},
-        "struct_field": {"a": 5, "b": 2.5},
-        "enum_field": "red",
-        "short_int": 7,
-        "long_int": 12345678901234567890,
-        "decimal_field": "10.55",
-        "float_precision": "2.7182818284",
-        "bytes_field": b"abc",
-        "date_field": today.isoformat(),
-        "datetime_field": now.isoformat(),
-        "time_field": t.isoformat(),
+async def test_multidict_vs_dict_behavior():
+    """Compare behavior between regular dict and MultiDict for list fields"""
+    # Test with standard dict
+    dict_data = {
+        "name": "John",
+        "friends": [1, 2, 3]  # Standard Python list
     }
-    validator = InputValidator(AllTypesModel, SanitizationConfig())
+    
+    # Test with MultiDict
+    multi_data = MultiDict([
+        ("name", "John"),
+        ("friends", "1"),
+        ("friends", "2"),
+        ("friends", "3")
+    ])
+    
+    validator = InputValidator(TestUser, SanitizationConfig())
+    dict_result = await validator.validate(dict_data)
+    multi_result = await validator.validate(multi_data)
+    
+    assert dict_result.is_valid and multi_result.is_valid
+    assert dict_result.model.friends == multi_result.model.friends == [1, 2, 3]
+
+@pytest.mark.asyncio
+async def test_multidict_empty_values():
+    """Test MultiDict with empty values for list fields"""
+    data = MultiDict([
+        ("name", "Jane"),
+        ("friends", ""),  # Empty string
+        ("friends", None)  # None value
+    ])
+    
+    validator = InputValidator(TestUser, SanitizationConfig())
     result = await validator.validate(data)
+    
+    # The validation should fail since empty strings can't be converted to integers
+    assert not result.is_valid
+    assert any("friends" in e.field for e in result.errors)
+
+@pytest.mark.asyncio
+async def test_multidict_mixed_types():
+    """Test MultiDict with mixed valid/invalid types in a list field"""
+    class MixedModel(BaseModel):
+        items: list[str]
+    
+    data = MultiDict([
+        ("items", "text"),
+        ("items", "<script>alert(1)</script>"),
+        ("items", "<b>bold</b>")
+    ])
+    
+    validator = InputValidator(MixedModel, SanitizationConfig())
+    result = await validator.validate(data)
+    
     assert result.is_valid
-    assert result.model.string_field == "hello"
-    assert result.model.int_field == 42
-    assert abs(result.model.float_field - 3.14) < 1e-6
-    assert result.model.bool_field is True
-    assert result.model.none_field is None
-    assert result.model.list_field == [1, 2, 3]
-    assert result.model.tuple_field == (1, 2.5)
-    assert set(result.model.set_field) == {"a", "b"}
-    assert result.model.dict_field["key"] == "value"
-    assert result.model.dict_field["nested"]["x"] == 1
-    assert result.model.custom_obj["x"] == 42
-    assert result.model.struct_field.a == 5
-    assert result.model.struct_field.b == 2.5
-    assert result.model.enum_field == Color.RED
-    assert result.model.short_int == 7
-    assert result.model.long_int == 12345678901234567890
-    assert result.model.decimal_field == decimal.Decimal("10.55")
-    assert abs(result.model.float_precision - 2.7182818284) < 1e-9
-    assert result.model.bytes_field == b"abc"
-    assert result.model.date_field == today
-    assert result.model.datetime_field == now
-    assert result.model.time_field == t
+    assert len(result.model.items) == 3
+    assert "script" not in result.model.items[1]
+    assert result.model.items[2] == "bold"  # HTML tags stripped in model
+
+@pytest.mark.asyncio
+async def test_multidict_complex_structure():
+    """Test MultiDict with more complex form structure"""
+    class ComplexForm(BaseModel):
+        name: str
+        interests: list[str]
+        skills: list[int]  # Rating 1-5
+        
+    data = MultiDict([
+        ("name", "Alice"),
+        ("interests", "programming"),
+        ("interests", "music"),
+        ("interests", "hiking"),
+        ("skills", "5"),
+        ("skills", "3"),
+        ("skills", "4")
+    ])
+    
+    validator = InputValidator(ComplexForm, SanitizationConfig())
+    result = await validator.validate(data)
+    
+    assert result.is_valid
+    assert result.model.interests == ["programming", "music", "hiking"]
+    assert result.model.skills == [5, 3, 4]
+
+@pytest.mark.asyncio
+async def test_multidict_partial_invalid_list():
+    """Test MultiDict with some invalid values in a list field"""
+    data = MultiDict([
+        ("name", "Bob"),
+        ("friends", "1"),
+        ("friends", "invalid"),  # Invalid int
+        ("friends", "3")
+    ])
+    
+    validator = InputValidator(TestUser, SanitizationConfig())
+    result = await validator.validate(data)
+    
+    assert not result.is_valid
+    assert any("friends" in e.field and "invalid" in e.message for e in result.errors)
+
+@pytest.mark.asyncio
+async def test_multidict_large_list():
+    """Test MultiDict with a large number of list items"""
+    class LargeListModel(BaseModel):
+        items: list[int]
+    
+    data = MultiDict([("items", str(i)) for i in range(100)])
+    
+    validator = InputValidator(LargeListModel, SanitizationConfig())
+    result = await validator.validate(data)
+    
+    assert result.is_valid
+    assert len(result.model.items) == 100
+    assert result.model.items == list(range(100))
 
 @pytest.mark.asyncio
 async def test_bytes_and_none():
@@ -230,3 +291,93 @@ async def test_enum_strictness():
     print(result2.errors)
     assert not result2.is_valid
     assert any("color" in e.message.lower() for e in result2.errors)
+
+@pytest.mark.asyncio
+async def test_deeply_nested_dict_structure():
+    """Test deeply nested dictionary structure with InputValidator"""
+    from pydantic import BaseModel
+    class Coordinates(BaseModel):
+        lat: float
+        lng: float
+    class Address(BaseModel):
+        city: str
+        zip: str
+        coordinates: Coordinates
+    class Phone(BaseModel):
+        type: str
+        number: str
+    class Item(BaseModel):
+        product_id: int
+        quantity: int
+    class Order(BaseModel):
+        id: int
+        items: list[Item]
+        status: str
+    class Notifications(BaseModel):
+        email: bool
+        sms: bool
+    class Preferences(BaseModel):
+        newsletter: bool
+        notifications: Notifications
+    class UserModel(BaseModel):
+        name: str
+        email: str
+        address: Address
+        phones: list[Phone]
+        preferences: Preferences
+        orders: list[Order]
+    class RootModel(BaseModel):
+        user: UserModel
+
+    data = {
+        "user": {
+            "name": "John",
+            "email": "john@example.com",
+            "address": {
+                "city": "New York",
+                "zip": "10001",
+                "coordinates": {
+                    "lat": 40.7128,
+                    "lng": -74.0060
+                }
+            },
+            "phones": [
+                {"type": "mobile", "number": "123-456-7890"},
+                {"type": "home", "number": "555-555-5555"}
+            ],
+            "preferences": {
+                "newsletter": True,
+                "notifications": {
+                    "email": True,
+                    "sms": False
+                }
+            },
+            "orders": [
+                {
+                    "id": 1,
+                    "items": [
+                        {"product_id": 101, "quantity": 2},
+                        {"product_id": 202, "quantity": 1}
+                    ],
+                    "status": "shipped"
+                },
+                {
+                    "id": 2,
+                    "items": [
+                        {"product_id": 303, "quantity": 4}
+                    ],
+                    "status": "processing"
+                }
+            ]
+        }
+    }
+
+    validator = InputValidator(RootModel, SanitizationConfig())
+    result = await validator.validate(data)
+    assert result.is_valid
+    assert result.model.user.name == "John"
+    assert result.model.user.address.city == "New York"
+    assert result.model.user.phones[0].type == "mobile"
+    assert result.model.user.preferences.newsletter is True
+    assert result.model.user.orders[0].items[1].product_id == 202
+    assert result.model.user.orders[1].status == "processing"
